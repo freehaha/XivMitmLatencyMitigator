@@ -24,6 +24,8 @@ import time
 import typing
 import urllib.request
 import zlib
+import sys
+import pwd
 
 import select
 
@@ -1222,7 +1224,8 @@ class Connection:
                  definitions: typing.List[OpcodeDefinition], args: ArgumentTuple):
         self.args = args
 
-        log_path = f"/tmp/xmlm.{datetime.datetime.now():%Y%m%d%H%M%S}.{os.getpid()}.log"
+        log_path = f"/dev/null"
+        # log_path = f"/tmp/xmlm.{datetime.datetime.now():%Y%m%d%H%M%S}.{os.getpid()}.log"
         logging.basicConfig(level=logging.INFO, force=True,
                             format="%(asctime)s\t%(process)d\t%(levelname)s\t%(message)s",
                             handlers=[
@@ -1677,6 +1680,40 @@ def load_rules(port: int, definitions: typing.List[OpcodeDefinition]) -> typing.
             rules.add(" ".join(rule))
     return rules
 
+def load_local_rules(port: int, definitions: typing.List[OpcodeDefinition], owner: str = "xivmit") -> typing.Set[str]:
+    local_ips = [
+        "0.0.0.0/8",
+        "10.0.0.0/8",
+        "127.0.0.0/8",
+        "169.254.0.0/16",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "224.0.0.0/4",
+        "240.0.0.0/4",
+    ]
+    rules = []
+    rules.append(f"-N XIVMIT")
+    rules.append(f"-A XIVMIT -m owner --uid-owner {owner} -j RETURN")
+    for local_ip in local_ips:
+        rules.append(f"-A XIVMIT -d {local_ip} -j RETURN")
+
+    for definition in definitions:
+        for iprange in definition.Server_IpRange:
+            rule = [
+                "-p tcp",
+                "-m multiport",
+                "--dports", ",".join(str(port1) if port1 == port2 else f"{port1}:{port2}"
+                                     for port1, port2 in definition.Server_PortRange)
+            ]
+            if isinstance(iprange, ipaddress.IPv4Network):
+                rule += ["-d", str(iprange)]
+            else:
+                rule += ["-m", "iprange", "--dst-range", f"{iprange[0]}-{iprange[1]}"]
+            rule.append(f"-j REDIRECT --to {port}")
+            rules.append("-A XIVMIT " + " ".join(rule))
+    return rules
+
+
 
 class BlockHeader(ctypes.LittleEndianStructure):
     COMPRESSED_SIZE_NOT_COMPRESSED = 32000
@@ -1795,6 +1832,10 @@ def __main__() -> int:
                         help="Download new opcodes again; do not use cached opcodes file.")
     parser.add_argument("-x", "--exe", action="store", type=str, dest="exe_url", default="",
                         help="Download ffxiv.exe from specified URL (exe or patch file.)")
+    parser.add_argument("-l", "--local", action="store_true", dest="run_locally",
+                        default=False, help="Local mode")
+    parser.add_argument("-U", "--run_as", action="store_true", dest="run_as",
+                        default="xivmit", help="user to run as")
     args: typing.Union[ArgumentTuple, argparse.Namespace] = parser.parse_args()
 
     if args.extra_delay < 0:
@@ -1839,68 +1880,100 @@ def __main__() -> int:
     cleanup_filename = os.path.basename(__file__) + ".cleanup.sh"
     if os.path.exists(cleanup_filename):
         os.system(cleanup_filename)
-    try:
-        with open(cleanup_filename, "w") as fp:
-            fp.write("#!/bin/sh\n")
-            for rule in load_rules(port, definitions):
-                iptables_cmd = f"iptables -t nat -I PREROUTING {rule}"
-                logging.info(f"Running: {iptables_cmd}")
-                if os.system(iptables_cmd):
-                    raise RootRequiredError
-                applied_rules.append(rule)
-                fp.write(f"iptables -t nat -D PREROUTING {rule}\n")
-        os.chmod(cleanup_filename, 0o777)
 
-        os.system("sysctl -w net.ipv4.ip_forward=1")
+    if args.run_locally:
+        os.system(f"iptables-save | grep -v XIVMIT | iptables-restore")
+        for rule in load_local_rules(port, definitions, args.run_as):
+            print(rule)
+            if os.system(f"iptables -t nat {rule}"):
+                os.system(f"iptables-save | grep -v XIVMIT | iptables-restore")
+                print("This program requires root permissions.\n")
+                return -1
+            applied_rules.append(rule)
 
-        listener.listen(8)
-        logging.info(f"Listening on {listener.getsockname()}...")
-        logging.info("Press Ctrl+C to quit.")
+        os.system(f"iptables -t nat -A OUTPUT -p tcp -j XIVMIT")
+        try:
+            pwrec = pwd.getpwnam("xivmit")
+            os.setuid(pwrec[2])
+        except KeyError:
+            print(f"user '${args.run_as}' not found")
+            return -1
+        applied_rules.append(rule)
+        try:
+            pwrec = pwd.getpwnam("xivmit")
+            os.setuid(pwrec[2])
+        except KeyError:
+            print("user 'xivmit' not found")
+            return -1
+    else:
+        try:
+            with open(cleanup_filename, "w") as fp:
+                fp.write("#!/bin/sh\n")
+                for rule in load_rules(port, definitions):
+                    iptables_cmd = f"iptables -t nat -I PREROUTING {rule}"
+                    logging.info(f"Running: {iptables_cmd}")
+                    if os.system(iptables_cmd):
+                        raise RootRequiredError
+                    applied_rules.append(rule)
+                    fp.write(f"iptables -t nat -D PREROUTING {rule}\n")
+            os.chmod(cleanup_filename, 0o777)
 
-        child_pids = set()
+            os.system("sysctl -w net.ipv4.ip_forward=1")
+        except RootRequiredError:
+            logging.error("This program requires root permissions.\n")
+            err = True
 
-        def on_child_exit(signum, frame):
-            if child_pids:
-                pid, status = os.waitpid(-1, os.WNOHANG)
-                if pid:
-                    logging.info(f"[{pid:<6}] has exit with status code {status}.")
-                    child_pids.discard(pid)
+    child_pids = set()
 
-        signal.signal(signal.SIGCHLD, on_child_exit)
+    def on_child_exit(signum, frame):
+        if child_pids:
+            pid, status = os.waitpid(-1, os.WNOHANG)
+            if pid:
+                logging.info(f"[{pid:<6}] has exit with status code {status}.")
+                child_pids.discard(pid)
 
-        while True:
-            for child_pid in child_pids:
-                try:
-                    os.kill(child_pid, 0)
-                except OSError:
-                    child_pids.remove(child_pid)
-            try:
-                sock, source = listener.accept()
-            except KeyboardInterrupt:
-                break
+    signal.signal(signal.SIGCHLD, on_child_exit)
 
-            child_pid = os.fork()
-            if child_pid == 0:
-                is_child = True
-                child_pids.clear()
-                listener.close()
-                return Connection(sock, source, definitions, args).run()
-            sock.close()
-            child_pids.add(child_pid)
+    listener.listen(8)
+    logging.info(f"Listening on {listener.getsockname()}...")
+    logging.info("Press Ctrl+C to quit.")
 
+    while True:
         for child_pid in child_pids:
             try:
-                os.kill(child_pid, signal.SIGINT)
+                os.kill(child_pid, 0)
             except OSError:
-                pass
+                child_pids.remove(child_pid)
+        try:
+            sock, source = listener.accept()
+        except KeyboardInterrupt:
+            break
 
-    except RootRequiredError:
-        logging.error("This program requires root permissions.\n")
-        err = True
+        child_pid = os.fork()
+        if child_pid == 0:
+            is_child = True
+            child_pids.clear()
+            listener.close()
+            return Connection(sock, source, definitions, args).run()
+        sock.close()
+        child_pids.add(child_pid)
 
-    finally:
-        if not is_child:
-            logging.info("Cleaning up...")
+    for child_pid in child_pids:
+        try:
+            os.kill(child_pid, signal.SIGINT)
+        except OSError:
+            pass
+
+    if not is_child:
+        logging.info("Cleaning up...")
+        if args.run_locally:
+            # if this is run as nobody then we won't be able to remove the rules
+            if not os.system(f"iptables-save | grep -v XIVMIT | iptables-restore"):
+                print(f"Failed to remove local iptables.")
+                print(f"Execute the following command to remove them:\n")
+                print(f"iptables-save | grep -v XIVMIT | iptables-restore")
+                err = True
+        else:
             for rule in applied_rules:
                 iptables_cmd = f"iptables -t nat -D PREROUTING {rule}"
                 logging.info(f"Running: {iptables_cmd}")
@@ -1913,8 +1986,22 @@ def __main__() -> int:
                 logging.error("One or more error have occurred during cleanup.")
                 return -1
             else:
-                logging.info("Cleanup complete.")
-                return 0
+                for rule in applied_rules:
+                    iptables_cmd = f"iptables -t nat -D PREROUTING {rule}"
+                    logging.info(f"Running: {iptables_cmd}")
+                    exit_code = os.system(iptables_cmd)
+                    if exit_code:
+                        logging.warning(f"\t=> Failed with exit code {exit_code}")
+                        err = True
+                os.remove(cleanup_filename)
+                if err:
+                    logging.error("One or more error have occurred during cleanup.")
+                    return -1
+                else:
+                    logging.info("Cleanup complete.")
+                    return 0
+        logging.info("Cleanup complete.")
+        return 0
 
 
 if __name__ == "__main__":
